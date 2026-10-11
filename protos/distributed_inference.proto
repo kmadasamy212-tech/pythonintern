@@ -1,0 +1,183 @@
+syntax = "proto3";
+
+package distributed_llm;
+
+// -------------------------------------------------------------
+// Configurations
+// -------------------------------------------------------------
+
+message ModelConfigProto {
+  int32 vocab_size = 1;
+  int32 hidden_dim = 2;
+  int32 num_layers = 3;
+  int32 num_heads = 4;
+  int32 num_kv_heads = 5;
+  int32 intermediate_dim = 6;
+  int32 max_seq_len = 7;
+  string dtype = 8;
+  float rms_norm_eps = 9;
+  float rope_theta = 10;
+}
+
+message ShardConfigProto {
+  int32 rank = 1;
+  int32 world_size = 2;
+  string host = 3;
+  int32 port = 4;
+  repeated string peer_addresses = 5;
+}
+
+message InitializeShardRequest {
+  ModelConfigProto model_config = 1;
+  ShardConfigProto shard_config = 2;
+  int32 num_kv_blocks = 3;
+  int32 block_size = 4;
+  string init_strategy = 5; // e.g. "random", "hf_checkpoint"
+  string checkpoint_path = 6;
+}
+
+message InitializeShardResponse {
+  bool success = 1;
+  string message = 2;
+  int64 allocated_memory_bytes = 3;
+}
+
+// -------------------------------------------------------------
+// Continuous Batching Sequence State
+// -------------------------------------------------------------
+
+message SequenceSlotProto {
+  string seq_id = 1;
+  bool is_prefill = 2;
+  repeated int32 prompt_token_ids = 3; // Provided during prefill
+  int32 current_token_id = 4;          // Last token for decode
+  int32 current_len = 5;               // Total sequence length so far
+  repeated int32 block_table = 6;      // Physical block IDs allocated for this sequence
+  int32 slot_offset = 7;               // Position in current block
+}
+
+message StepRequest {
+  int64 step_id = 1;
+  repeated SequenceSlotProto active_sequences = 2;
+}
+
+message SampledTokenProto {
+  string seq_id = 1;
+  int32 token_id = 2;
+  repeated float top_logits = 3;
+}
+
+message StepResponse {
+  int64 step_id = 1;
+  int32 rank = 2;
+  bool success = 3;
+  string error_message = 4;
+  repeated SampledTokenProto sampled_tokens = 5;
+  float step_latency_ms = 6;
+  int32 active_blocks = 7;
+  int32 free_blocks = 8;
+}
+
+// -------------------------------------------------------------
+// Tensor Parallelism Collective Communication (gRPC All-Reduce)
+// -------------------------------------------------------------
+
+message AllReducePayload {
+  string step_tag = 1;                 // Unique identifier: e.g. "step_12_layer_3_attn"
+  int32 sender_rank = 2;
+  repeated int64 shape = 3;
+  string dtype = 4;                    // "float32", "float16", "bfloat16"
+  bytes raw_tensor_data = 5;           // Direct byte buffer
+}
+
+message AllReduceResponse {
+  bool success = 1;
+  string error_message = 2;
+}
+
+// -------------------------------------------------------------
+// Eviction and Health
+// -------------------------------------------------------------
+
+message EvictSequencesRequest {
+  repeated string seq_ids = 1;
+}
+
+message EvictSequencesResponse {
+  bool success = 1;
+  int32 freed_blocks = 2;
+}
+
+message WorkerStatusRequest {}
+
+message WorkerStatusResponse {
+  int32 rank = 1;
+  int32 world_size = 2;
+  bool is_ready = 3;
+  int64 memory_used_bytes = 4;
+  int64 total_memory_bytes = 5;
+  int32 total_kv_blocks = 6;
+  int32 free_kv_blocks = 7;
+  float avg_step_latency_ms = 8;
+  string device = 9;
+}
+
+// -------------------------------------------------------------
+// Client Inference API
+// -------------------------------------------------------------
+
+message SamplingParamsProto {
+  float temperature = 1;
+  float top_p = 2;
+  int32 top_k = 3;
+  int32 max_new_tokens = 4;
+  repeated string stop_sequences = 5;
+  repeated int32 stop_token_ids = 6;
+}
+
+message GenerateRequest {
+  string request_id = 1;
+  string prompt = 2;
+  repeated int32 prompt_token_ids = 3;
+  SamplingParamsProto sampling_params = 4;
+}
+
+message GenerateResponse {
+  string request_id = 1;
+  int32 token_id = 2;
+  string text_delta = 3;
+  bool is_finished = 4;
+  string finish_reason = 5; // "stop", "length", "preempted", "error"
+  float ttft_ms = 6;
+  float total_latency_ms = 7;
+  int32 total_tokens_generated = 8;
+}
+
+message ClusterStatusRequest {}
+
+message ClusterStatusResponse {
+  int32 num_workers = 1;
+  int32 healthy_workers = 2;
+  repeated WorkerStatusResponse worker_statuses = 3;
+  int32 queue_depth = 4;
+  int32 running_requests = 5;
+  int64 total_tokens_generated = 6;
+  float current_throughput_tokens_sec = 7;
+}
+
+// -------------------------------------------------------------
+// Services
+// -------------------------------------------------------------
+
+service WorkerService {
+  rpc InitializeShard(InitializeShardRequest) returns (InitializeShardResponse);
+  rpc ExecuteStep(StepRequest) returns (StepResponse);
+  rpc ExchangeAllReduce(AllReducePayload) returns (AllReduceResponse);
+  rpc EvictSequences(EvictSequencesRequest) returns (EvictSequencesResponse);
+  rpc GetStatus(WorkerStatusRequest) returns (WorkerStatusResponse);
+}
+
+service InferenceCoordinatorService {
+  rpc GenerateStream(GenerateRequest) returns (stream GenerateResponse);
+  rpc GetClusterStatus(ClusterStatusRequest) returns (ClusterStatusResponse);
+}
